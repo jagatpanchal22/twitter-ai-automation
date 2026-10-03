@@ -1,6 +1,6 @@
 # Twitter AI Automation — Specification
 
-Status: **Draft v0.2** · Owner: Jagat Panchal · Last updated: 2026-10-02
+Status: **Draft v0.3** · Owner: Jagat Panchal · Last updated: 2026-10-03
 
 This document defines what we are building and how, before any implementation starts.
 Sections marked **[DECISION]** are open choices with a proposed default; confirm or change them before the related milestone begins.
@@ -80,7 +80,7 @@ Users belong to a **Workspace** (Better Auth "organization"). X accounts, voice 
 - FR-10: Generate N (1–10) single-tweet drafts from: a topic, a source URL (fetched & summarized server-side), or a free-form prompt.
 - FR-11: Generate a thread (2–15 tweets) from the same inputs.
 - FR-12: Rewrite an existing draft: shorter, punchier, more formal, add hook, translate, etc.
-- FR-13: Every generated tweet is validated against X's length rules (280 weighted chars, URLs count as 23, via `twitter-text`) and regenerated/trimmed if over.
+- FR-13: Every generated tweet is validated against X's length rules (weighted characters, URLs count as 23, via `twitter-text`) and regenerated/trimmed if over. The limit is 280 for standard accounts. For accounts with an X Premium subscription, long posts are allowed: a per-account `max_post_length` setting (default 280) lets the user opt in to longer single posts as an alternative to threads. **[DECISION]** confirm X API support for long posts on the user's account during M2.
 - FR-14: Generation runs as a background job (QStash → `/api/jobs/generate`); the UI polls the generation status. Results may also be streamed for rewrites, which are short.
 - FR-15: Store prompt inputs, model used, token usage, cost, and latency for each generation.
 - FR-16: Basic content safety: reject/flag outputs that contain disallowed content per workspace "avoid" list; never auto-publish flagged content.
@@ -105,7 +105,7 @@ Users belong to a **Workspace** (Better Auth "organization"). X accounts, voice 
 - FR-29: Fetch public metrics for published tweets at +1h, +24h, and +7d after publishing (three delayed QStash jobs enqueued at publish time), then stop.
 - FR-30: Store metric snapshots (time-series), not just latest values.
 - FR-31: Dashboard: per-account totals over a date range, top posts, simple chart of engagement over time.
-- FR-32: Track AI generation cost per workspace per month.
+- FR-32: Track cost per workspace per month for AI generation **and X API usage** (X bills pay-per-use per post created and per post read; posts containing a link cost more — see §12). Show both in the dashboard, with an optional monthly X API budget that blocks scheduling new posts when exceeded.
 
 ### 4.8 Notifications
 - FR-33: In-app notification list for: post failed, account needs re-auth, post awaiting approval.
@@ -190,10 +190,10 @@ Defined with Drizzle in `db/schema.ts`. All tables have `id` (UUID), `created_at
 | Model | Key fields |
 |---|---|
 | `user` | email (unique), name, emailVerified (Better Auth) |
-| `organization` (= Workspace) | name, slug, timezone, monthly_ai_budget_usd (nullable) |
+| `organization` (= Workspace) | name, slug, timezone, monthly_ai_budget_usd (nullable), monthly_x_budget_usd (nullable) |
 | `member` | user, organization, role (owner/editor/contributor/viewer) |
 | `invitation` | organization, email, role, expires_at, status |
-| `x_accounts` | workspace, x_user_id, username, display_name, avatar_url, access_token_enc, refresh_token_enc, token_expires_at, status (active/needs_reauth/disconnected), scopes |
+| `x_accounts` | workspace, x_user_id, username, max_post_length (default 280), display_name, avatar_url, access_token_enc, refresh_token_enc, token_expires_at, status (active/needs_reauth/disconnected), scopes |
 | `voice_profiles` | x_account, name, tone, audience, topics, avoid_topics, example_tweets (jsonb), hashtag_policy, emoji_policy, language, is_default |
 | `posting_slots` | x_account, weekday (0–6), local_time |
 | `posts` | workspace, x_account, voice_profile (nullable), kind (tweet/thread), status, scheduled_at, published_at, created_by, approved_by, approved_at, attempt_count, last_error, generation (nullable) |
@@ -269,7 +269,7 @@ twitter-ai-automation/
 
 ## 12. Open questions / decisions
 
-1. **X API tier** — the Free tier allows very limited posting and cannot read metrics; analytics (§4.7) needs Basic or higher. Which tier will be used? This is the biggest cost and feasibility factor, independent of Vercel.
+1. **X API access** — *Resolved in part.* The owner has a 1-year **X Premium** subscription. Premium is the consumer subscription for the account (blue check, long posts); it **does not include API access**. API access is bought separately in the X Developer Console, which (since February 2026) uses **pay-per-use** credits for new developers instead of Free/Basic/Pro tiers. Approximate published rates (verify in the console before M2): ~$0.015 per post created, ~$0.20 per post that contains a link, ~$0.005 per post read. Example at 5 posts/day: ~150 posts/month ≈ $2–3 without links, or ≈ $30 if every post has a link; metrics at 3 reads per post ≈ $2–3. Action: create a developer account and project/app, add credits, and configure OAuth 2.0 (redirect URL from §15).
 2. **LLM provider** — Claude by default; any requirement for another provider?
 3. **ORM** — Drizzle (default) or Prisma.
 4. **Auth library** — Better Auth (default) or Auth.js.
