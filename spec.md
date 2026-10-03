@@ -313,6 +313,8 @@ Set in Vercel project settings (Marketplace integrations add the database ones a
 
 ## 16. Milestones
 
+The step-by-step build order (Phases 0–9, mapped to these milestones) is in [PLAN.md](PLAN.md).
+
 | # | Milestone | Scope | Done when |
 |---|---|---|---|
 | M0 | Foundation | Next.js + TypeScript + Tailwind/shadcn, Drizzle + Neon, Upstash Redis/QStash clients, `vercel.json`, CI, `.env.example`, health endpoint, the daily cron and one delayed QStash job wired end to end | Deployed to Vercel Hobby; CI green; a delayed job fires at its set time in production |
