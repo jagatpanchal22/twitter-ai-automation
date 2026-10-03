@@ -1,11 +1,13 @@
 # Twitter AI Automation — Specification
 
-Status: **Draft v0.3** · Owner: Jagat Panchal · Last updated: 2026-10-03
+Status: **Draft v0.4** · Owner: Jagat Panchal · Last updated: 2026-10-03
 
 This document defines what we are building and how, before any implementation starts.
 Sections marked **[DECISION]** are open choices with a proposed default; confirm or change them before the related milestone begins.
 
-**Changes from v0.1:** the target platform is now **Vercel (Pro plan)**. Vercel runs serverless functions, not long-lived processes, so the Django + Celery + Vue stack is replaced by a Vercel-native stack: Next.js (TypeScript), Neon Postgres, Upstash Redis, Upstash QStash, and Vercel Cron.
+**Changes from v0.1:** the target platform is now **Vercel**. Vercel runs serverless functions, not long-lived processes, so the Django + Celery + Vue stack is replaced by a Vercel-native stack: Next.js (TypeScript), Neon Postgres, Upstash Redis, Upstash QStash, and Vercel Cron.
+
+**Changes in v0.4:** the target is the **Vercel Hobby (free) plan**. Hobby cron jobs run at most once a day, so publishing no longer depends on an every-minute cron. Instead, each scheduled post gets its own **delayed QStash message** that fires at the post's time. One daily Vercel Cron job handles posts scheduled more than 7 days ahead and housekeeping. Every service in the stack has a free tier that fits this design (see §7.2).
 
 ---
 
@@ -23,7 +25,7 @@ An AI-assisted system for managing X (Twitter) accounts. Users connect one or mo
 | ORM / migrations | **Drizzle ORM** + drizzle-kit | Lightweight, works with Neon's serverless driver, SQL-first. **[DECISION]** alternative: Prisma |
 | Auth | **Better Auth** (email + password, organization/role plugin) | Built-in workspaces, invitations, roles. **[DECISION]** alternative: Auth.js |
 | Background jobs | **Upstash QStash** (HTTP job queue with retries, delays, dedupe) | Serverless replacement for Celery workers |
-| Scheduler | **Vercel Cron** (every minute, Pro plan) | Serverless replacement for Celery beat |
+| Scheduler | **Delayed QStash messages** (one per scheduled post) + **one daily Vercel Cron** job | Works on the Hobby plan, where cron can run only once a day |
 | Cache / rate limits / locks | **Upstash Redis** + `@upstash/ratelimit` | HTTP-based Redis that works from serverless functions |
 | LLM | **Vercel AI SDK** with the Anthropic provider (Claude) | Structured output with zod schemas; provider swappable |
 | Validation | zod (shared by API, forms, LLM output) | One schema source of truth |
@@ -94,7 +96,8 @@ Users belong to a **Workspace** (Better Auth "organization"). X accounts, voice 
 ### 4.6 Scheduling and publishing
 - FR-21: Schedule a post for a specific datetime (stored UTC, displayed in the workspace's timezone).
 - FR-22: Optional per-account **posting slots** (e.g. weekdays 09:00, 13:00, 18:00) and "add to next free slot".
-- FR-23: Vercel Cron calls `/api/cron/dispatch` every minute. It selects due posts and enqueues one QStash job per post (`/api/jobs/publish`), using the post ID as the QStash deduplication ID.
+- FR-23: When a post is scheduled for within the next 7 days, the app immediately publishes a **delayed QStash message** to `/api/jobs/publish` that fires at `scheduled_at` (QStash free tier allows delays up to 7 days). The message ID is stored on the post. Posts scheduled further ahead get their message later from the daily cron (§6.1), once they are within 7 days.
+- FR-23a: Rescheduling or cancelling a post deletes its pending QStash message and, for a reschedule, creates a new one. As a safety net, the publish job payload carries the `scheduled_at` it was created for; if that no longer matches the post, or the post is no longer `scheduled`, the job does nothing.
 - FR-24: Publishing is **idempotent**. The job claims the post with a single atomic statement (`UPDATE posts SET status='publishing' … WHERE id=$1 AND status='scheduled' RETURNING *`). If no row returns, the job exits. Each tweet's X ID is saved immediately after it is created, and an item that has an X ID is never posted again.
 - FR-25: Threads are published sequentially in one job, each reply referencing the previous tweet ID. On partial failure, the job records which tweets went out, and a retry resumes from the first unpublished item.
 - FR-26: Retries: on 429/5xx/network errors the job returns a 5xx so QStash retries with backoff (max 5 attempts). On auth errors (401/403), the account is marked `needs_reauth` and the post fails without retry.
@@ -129,7 +132,7 @@ Users belong to a **Workspace** (Better Auth "organization"). X accounts, voice 
 ## 6. Architecture
 
 ```
-                         ┌──────────────────────────── Vercel (Pro) ─────────────────────────────┐
+                         ┌─────────────────────────── Vercel (Hobby) ────────────────────────────┐
  Browser ── HTTPS ──────▶│ Next.js app                                                           │
                          │  • React pages (Server + Client Components)                           │
                          │  • /api/v1/*      REST route handlers (session auth)                  │
@@ -139,7 +142,7 @@ Users belong to a **Workspace** (Better Auth "organization"). X accounts, voice 
                                 │               │                  │                  │
                         ┌───────▼──────┐ ┌──────▼───────┐  ┌───────▼───────┐   ┌──────▼──────┐
                         │ Neon Postgres│ │ Upstash Redis│  │ Upstash QStash│   │ Vercel Cron │
-                        │  (data)      │ │ rate limits, │  │ job queue,    │   │ every 1 min │
+                        │  (data)      │ │ rate limits, │  │ job queue,    │   │ once a day  │
                         └──────────────┘ │ cache, locks │  │ retries/delay │   └─────────────┘
                                          └──────────────┘  └───────┬───────┘
                                                                    │ calls back /api/jobs/*
@@ -147,8 +150,8 @@ Users belong to a **Workspace** (Better Auth "organization"). X accounts, voice 
 ```
 
 How jobs flow:
-1. An API request or cron run **enqueues** a job by publishing a message to QStash, addressed to one of our `/api/jobs/*` URLs.
-2. QStash **calls that URL** (immediately or after a delay), signed with a key we verify.
+1. An API request (or the daily cron) **enqueues** a job by publishing a message to QStash, addressed to one of our `/api/jobs/*` URLs.
+2. QStash **calls that URL** — immediately, or at a set time for scheduled posts and metrics — signed with a key we verify.
 3. The handler does the work. A 2xx response completes the job; a 5xx makes QStash retry with backoff. After the last retry, the message goes to the QStash dead-letter queue, and a failure callback marks the post `failed`.
 
 Code is organised so that route handlers are thin: all business logic lives in `lib/` services (`posts`, `generation`, `x`, …), which are unit-testable without HTTP. External APIs are wrapped in `XClient` and `LLMClient` so tests can mock them.
@@ -158,12 +161,12 @@ Code is organised so that route handlers are thin: all business logic lives in `
 | Job / endpoint | Triggered by | Notes |
 |---|---|---|
 | `POST /api/jobs/generate` | API request | LLM call; max duration 300 s |
-| `GET /api/cron/dispatch` | Vercel Cron, `* * * * *` | Finds due posts, enqueues publish jobs (dedupe by post ID) |
-| `POST /api/jobs/publish` | dispatch / publish-now | Atomic claim, publish tweet(s), enqueue metrics jobs |
+| `POST /api/jobs/publish` | delayed QStash message at `scheduled_at` / publish-now | Check payload still matches post, atomic claim, publish tweet(s), enqueue metrics jobs |
 | `POST /api/jobs/metrics` | delayed QStash jobs (+1h, +24h, +7d) | Fetch and store one metric snapshot |
-| `GET /api/cron/refresh-tokens` | Vercel Cron, every 15 min | Refresh X tokens expiring within 30 min |
-| `GET /api/cron/reconcile` | Vercel Cron, every 10 min | Posts stuck in `publishing` > 10 min: check X for the tweet, then mark published or re-enqueue |
+| `GET /api/cron/daily` | Vercel Cron, once a day (`0 3 * * *` UTC) | (1) create QStash messages for posts that are now within 7 days and have none; (2) find posts stuck in `publishing` > 10 min, check X for the tweet, then mark published or re-enqueue; (3) refresh X tokens for accounts not used in the last 24 h so they don't lapse; (4) find `scheduled` posts whose time has passed without publishing and publish them now (safety net) |
 | `POST /api/jobs/failed` | QStash failure callback | Marks the job's post/generation `failed`, creates notification |
+
+**Token refresh is on demand:** before every X API call, `XClient` refreshes the access token if it expires within 5 minutes, holding a short Redis lock so two jobs don't refresh the same account at once. This replaces the every-15-minute refresh cron, which Hobby can't run.
 
 ## 7. Deployment (Vercel)
 
@@ -173,8 +176,12 @@ Code is organised so that route handlers are thin: all business logic lives in `
 - **Local:** `next dev` with a Neon dev branch, and the QStash local dev server (`npx @upstash/qstash-cli dev`) so jobs can be tested without deploying.
 
 ### 7.2 Platform limits to design around (verify current values when starting M0)
-- **Function duration:** with Fluid compute on Pro, the default max is 300 s, and it can be raised. Set `maxDuration` per route. A generation or thread publish must fit in one invocation; anything longer is split into multiple QStash jobs.
-- **Cron:** Pro allows per-minute schedules. Cron timing is approximate (within the minute) and cron calls are not retried, so `dispatch` must be safe to run late or twice. The atomic claim (FR-24) and QStash dedupe make it so.
+- **Function duration:** Hobby with Fluid compute allows up to 300 s per invocation. Set `maxDuration` per route. A generation or thread publish must fit in one invocation; anything longer is split into multiple QStash jobs.
+- **Cron (Hobby):** at most 2 cron jobs, each at most once a day, and the run time can drift by up to an hour. We use one (`/api/cron/daily`), and nothing time-sensitive depends on it. Cron calls are not retried, so it must be safe to run late or twice.
+- **Hobby usage allowance (monthly):** about 1 million function invocations and 4 hours of active CPU. Waiting on the X API or Claude is not active CPU, so personal use stays well inside this.
+- **Hobby is for non-commercial use only.** If the app is used for paid client work or a business, Vercel requires the Pro plan. Moving to Pro needs no code change. Optionally, publishing could then use a finer-grained cron as an extra safety net.
+- **QStash free tier:** 1,000 messages per day and a maximum delay of 7 days. Each post uses about 5 messages (generation, publish, three metric checks), so this covers well over 100 posts a day.
+- **Neon and Upstash Redis free tiers** are sufficient for one person or a small team.
 - **Database connections:** use Neon's pooled connection string and serverless driver; never open a connection per request without pooling.
 - **No local state:** no in-memory caches or files between requests; use Redis or Postgres.
 - **Request body size:** ~4.5 MB limit — media uploads (v1.1) go directly from the browser to Vercel Blob.
@@ -196,7 +203,7 @@ Defined with Drizzle in `db/schema.ts`. All tables have `id` (UUID), `created_at
 | `x_accounts` | workspace, x_user_id, username, max_post_length (default 280), display_name, avatar_url, access_token_enc, refresh_token_enc, token_expires_at, status (active/needs_reauth/disconnected), scopes |
 | `voice_profiles` | x_account, name, tone, audience, topics, avoid_topics, example_tweets (jsonb), hashtag_policy, emoji_policy, language, is_default |
 | `posting_slots` | x_account, weekday (0–6), local_time |
-| `posts` | workspace, x_account, voice_profile (nullable), kind (tweet/thread), status, scheduled_at, published_at, created_by, approved_by, approved_at, attempt_count, last_error, generation (nullable) |
+| `posts` | workspace, x_account, voice_profile (nullable), kind (tweet/thread), status, scheduled_at, qstash_message_id (nullable), published_at, created_by, approved_by, approved_at, attempt_count, last_error, generation (nullable) |
 | `post_items` | post, position (0..n), text, x_tweet_id (nullable), published_at — one row for a tweet, n rows for a thread |
 | `post_revisions` | post, author, snapshot (jsonb of items' text) |
 | `generations` | workspace, x_account, voice_profile, requested_by, mode (tweets/thread/rewrite), input (jsonb), status (queued/running/succeeded/failed), output (jsonb candidates), model, input_tokens, output_tokens, cost_usd, latency_ms, error |
@@ -249,7 +256,7 @@ twitter-ai-automation/
 │       ├── auth/[...all]/          # Better Auth
 │       ├── v1/                     # REST route handlers
 │       ├── jobs/{generate,publish,metrics,failed}/
-│       └── cron/{dispatch,refresh-tokens,reconcile}/
+│       └── cron/daily/
 ├── components/                     # shadcn/ui + app components
 ├── lib/
 │   ├── auth.ts, permissions.ts
@@ -262,7 +269,7 @@ twitter-ai-automation/
 │   └── crypto.ts                   # token encryption
 ├── drizzle/                        # generated migrations
 ├── tests/                          # unit, integration, e2e (Playwright)
-├── vercel.json                     # crons, function maxDuration
+├── vercel.json                     # the daily cron, function maxDuration
 ├── .env.example
 └── .github/workflows/ci.yml
 ```
@@ -276,6 +283,7 @@ twitter-ai-automation/
 5. **Auto-approve** — should a later version allow fully automated posting for trusted accounts? (Off in v1.)
 6. **Preview deployments and X** — confirm a separate dev X app for previews.
 7. **Media upload** — v1.1 (default) or v1?
+8. **Commercial use** — Vercel Hobby is for personal, non-commercial projects. If this will be used for clients or a business, budget for Vercel Pro (no code changes needed).
 
 ## 13. Dashboard screens
 
@@ -293,7 +301,7 @@ twitter-ai-automation/
 
 - **Unit (Vitest):** post state machine, length validation, prompt building, rate-limit logic, token encryption, permission checks.
 - **Integration (Vitest):** route handlers against a real Postgres (Neon branch in CI, or a Postgres service container), with X, Anthropic, and QStash mocked via MSW. Job handlers are called directly with signed test payloads.
-- **Critical-path tests:** no duplicate publish when two publish jobs run at once; thread partial failure resumes correctly; token refresh on 401; dispatch running twice in one minute.
+- **Critical-path tests:** no duplicate publish when two publish jobs run at once; thread partial failure resumes correctly; token refresh on 401; a stale publish message after a reschedule does nothing; the daily cron running twice.
 - **E2E (Playwright):** login → generate → approve → schedule against a preview deployment, with a mocked X.
 - **CI (GitHub Actions):** typecheck (`tsc`), ESLint, Vitest, `drizzle-kit check`, `next build` on every PR. Vercel creates the preview deployment.
 
@@ -307,9 +315,9 @@ Set in Vercel project settings (Marketplace integrations add the database ones a
 
 | # | Milestone | Scope | Done when |
 |---|---|---|---|
-| M0 | Foundation | Next.js + TypeScript + Tailwind/shadcn, Drizzle + Neon, Upstash Redis/QStash clients, `vercel.json`, CI, `.env.example`, health endpoint, one example cron and one example QStash job wired end to end | Deployed to Vercel; CI green; example job and cron run in production |
+| M0 | Foundation | Next.js + TypeScript + Tailwind/shadcn, Drizzle + Neon, Upstash Redis/QStash clients, `vercel.json`, CI, `.env.example`, health endpoint, the daily cron and one delayed QStash job wired end to end | Deployed to Vercel Hobby; CI green; a delayed job fires at its set time in production |
 | M1 | Auth & workspaces | FR-1 – FR-3, roles & permissions, auth UI | Users can sign up, create workspace, invite member |
-| M2 | X connection | FR-4 – FR-7, encrypted tokens, refresh cron, accounts UI | Can connect/disconnect a real X account |
+| M2 | X connection | FR-4 – FR-7, encrypted tokens, on-demand token refresh, accounts UI | Can connect/disconnect a real X account |
 | M3 | AI generation | Voice profiles, FR-8 – FR-16, compose UI | Generate tweets & threads in a voice, save as drafts |
 | M4 | Workflow & scheduling | FR-17 – FR-19, FR-21 – FR-28, queue/calendar UI | Approved posts publish on time, no duplicates, retries work |
 | M5 | Analytics & notifications | FR-29 – FR-33, FR-35, analytics UI | Metrics collected & charted; failure notifications visible |
